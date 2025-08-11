@@ -14,33 +14,36 @@ from langgraph.graph import MessagesState
 from langgraph.prebuilt import tools_condition
 from langgraph.graph import StateGraph, START
 
-from tools_voyage import (
-  get_ais_gaps,
-  get_sts_data,
-  get_zone_port_events,
-  get_positional_discrepancy,
-)
+from tools_voyage import get_ais_gaps, get_sts_data, get_zone_port_events, \
+  get_positional_discrepancy, get_ais_positions
 
 VOYAGE_POLICY = (
   "You are the Voyage Insights specialist.\n"
   "Use session defaults (IMO/MMSI/time window, last_vessels) and hints (min_duration_hours, selection_limit).\n"
   "Only call the tools explicitly requested (sts, gaps, positional_discrepancy, zone_port).\n"
+  "Additionally, whenever you call ANY of those tools, also call get_ais_positions exactly once with the same MMSI and time window. "
+  "The AIS positions output is logging-only; never include it in user-facing replies.\n"
   "If you lack IMO and last_vessels, DO NOT call any tools; ask a short clarifying question.\n"
   "Never search vessels here; never mass-fanout without explicit user instruction and a selection limit.\n"
 )
 
-VOYAGE_TOOLS = [get_ais_gaps, get_sts_data, get_zone_port_events, get_positional_discrepancy]
+VOYAGE_TOOLS = [
+  get_ais_gaps,
+  get_sts_data,
+  get_zone_port_events,
+  get_positional_discrepancy,
+  get_ais_positions,
+]
 
 # caps to avoid accidental blowups; require user to specify 'top N' to exceed small limits
 MAX_FANOUT_DEFAULT = 10
-
 
 def _has_default_imo(ctx_text: str) -> bool:
   return "default_imo=" in (ctx_text or "")
 
 
 def _last_vessels_count(ctx_text: str) -> int:
-  # context_system_prompt includes last_vessels_available=<n> if present
+  # context_system_prompt may include last_vessels_available=<n> if present
   m = re.search(r"last_vessels_available=(\d+)", ctx_text or "")
   return int(m.group(1)) if m else 0
 
@@ -51,6 +54,12 @@ def _selection_limit(ctx_text: str) -> int:
 
 
 class VoyageInsightsAgent:
+  """
+  Specialist for Voyage Insights. Plans tool calls with an LLM, executes them,
+  and (important) runs AIS positions as a **side-effect** for logging only when
+  any voyage tool is invoked — without emitting a ToolMessage for it.
+  """
+
   def __init__(self):
     self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools(VOYAGE_TOOLS)
     self.graph = self._build()
@@ -106,9 +115,42 @@ class VoyageInsightsAgent:
     return {"messages": [ai]}
 
   def _tools_node(self, state: MessagesState):
+    """
+    Execute exactly the tool calls the LLM requested (returning ToolMessages with
+    the correct tool_call_id), and ALSO run get_ais_positions once as a **side-effect**
+    when any voyage tool is present — WITHOUT returning a ToolMessage for it.
+    This avoids OpenAI's 'tool_call_id not found' error.
+    """
     last = state["messages"][-1]
-    tcs = getattr(last, "tool_calls", None) or []
+    tcs = list(getattr(last, "tool_calls", None) or [])
 
+    # --- SIDE-EFFECT: auto-run AIS positions (no ToolMessage) -----------------
+    voyage_names = {"get_sts_data", "get_ais_gaps", "get_positional_discrepancy", "get_zone_port_events"}
+    names = {c.get("name") for c in tcs}
+    should_side_effect_positions = any(n in voyage_names for n in names) and ("get_ais_positions" not in names)
+
+    if should_side_effect_positions:
+      # Try to reuse arguments from one of the voyage tools
+      base_args = {}
+      for c in tcs:
+        if c.get("name") in voyage_names:
+          base_args = c.get("args") or {}
+          break
+      try:
+        # Call the tool directly; DO NOT create a ToolMessage
+        from tools_voyage import get_ais_positions  # local import avoids circulars
+        _ = get_ais_positions.invoke({
+          "imo": base_args.get("imo"),
+          "mmsi": base_args.get("mmsi"),
+          "timestamp_start": base_args.get("timestamp_start"),
+          "timestamp_end": base_args.get("timestamp_end"),
+        })
+        # its return is {"type":"__log_only",...}; intentionally ignored
+      except Exception as e:
+        # swallow/log; positions are best-effort
+        print(f"[AIS-POSITIONS side-effect] {type(e).__name__}: {e}")
+
+    # --- Execute ONLY the LLM-requested tool calls and return ToolMessages ----
     from concurrent.futures import ThreadPoolExecutor, as_completed
     name_to_tool = {t.name: t for t in VOYAGE_TOOLS}
 
@@ -128,10 +170,12 @@ class VoyageInsightsAgent:
       return ToolMessage(content=json.dumps(result), name=name, tool_call_id=call_id)
 
     msgs: List[ToolMessage] = []
-    with ThreadPoolExecutor(max_workers=max(1, len(tcs))) as ex:
-      futures = [ex.submit(_invoke, c) for c in tcs]
-      for f in as_completed(futures):
-        msgs.append(f.result())
+    if tcs:
+      with ThreadPoolExecutor(max_workers=max(1, len(tcs))) as ex:
+        futures = [ex.submit(_invoke, c) for c in tcs]
+        for f in as_completed(futures):
+          msgs.append(f.result())
+
     return {"messages": msgs}
 
   def _build(self):
@@ -146,8 +190,9 @@ class VoyageInsightsAgent:
   # ---------- public ----------
   def run(self, context_system: SystemMessage, user_msg: HumanMessage, history: List[AnyMessage]):
     """
-    Execute the voyage specialist using a cleaned history to avoid OpenAI 'tool_calls must be followed by tool responses'
-    errors and to prevent accidental re-interpretation of past tool plans.
+    Execute the voyage specialist using a cleaned history to avoid OpenAI
+    'tool_calls must be followed by tool responses' issues and to prevent
+    accidental re-interpretation of past tool plans.
     """
     msgs: List[AnyMessage] = [SystemMessage(content=VOYAGE_POLICY)]
     if context_system:

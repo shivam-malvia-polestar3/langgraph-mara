@@ -1,13 +1,21 @@
+import json
 from typing import Optional
 from langchain_core.tools import tool
+import requests
+
+from secret_manager import get_credentials_from_secrets_manager
+
+_creds_cache = get_credentials_from_secrets_manager()
+ais_username = _creds_cache.get("ais_username")
+ais_password = _creds_cache.get("ais_password")
 
 from tools_common import (
-  APPLICATION_API_BASE, _normalize_ts, get_12_months_old_timestamp,
-  get_current_timestamp, fetch_all_records,
+  APPLICATION_API_BASE, _normalize_ts,
+   fetch_all_records,
   normalize_ais_gaps_response, normalize_sts_response,
-  normalize_zone_port_events, normalize_spoofing_events
+  normalize_zone_port_events, normalize_spoofing_events,
+  fetch_ais_positions_data
 )
-
 def get_STS_min_duration_hours() -> int: return 6
 def get_spoofing_min_duration_hours() -> int: return 72
 def get_gaps_min_duration_hours() -> int: return 12
@@ -94,3 +102,68 @@ def get_positional_discrepancy(imo: str,
   events, total, urls = fetch_all_records(endpoint, q)
   normalized = normalize_spoofing_events({"data": {"events": events}})
   return {"type": "p_d", "records": normalized, "total": total, "sources": urls}
+
+@tool(
+    "get_ais_positions",
+    description=(
+        "Fetch AIS track positions for a vessel (logging only). "
+        "Args: mmsi (preferred) or imo, timestamp_start, timestamp_end. "
+        "Returns type='__log_only'. Never include this output in user-facing responses."
+    ),
+)
+def get_ais_positions(
+    imo: Optional[str] = None,
+    mmsi: Optional[str] = None,
+    timestamp_start: Optional[str] = None,
+    timestamp_end: Optional[str] = None,
+) -> dict:
+  """Logging-only AIS positions fetch:
+  1) normalize timestamps
+  2) build track URL via fetch_ais_positions_data(...)
+  3) GET the URL
+  4) print a compact summary to console
+  5) return a marker payload so response layer can ignore it
+  """
+  ts_start = _normalize_ts(timestamp_start, "start")
+  ts_end   = _normalize_ts(timestamp_end, "end")
+  mmsi="636018321"
+  if not ais_username or not ais_password:
+    print("[AIS-POSITIONS] Missing AIS credentials in Secrets Manager")
+    return {"type": "__log_only", "tool": "get_ais_positions", "reason": "missing_ais_creds"}
+  if not mmsi:
+    print(f"[AIS-POSITIONS] Skipping: MMSI missing (imo={imo}, ts={ts_start}→{ts_end})")
+    return {"type": "__log_only", "tool": "get_ais_positions", "reason": "missing_mmsi"}
+
+  url = fetch_ais_positions_data(mmsi=mmsi, ts_start=ts_start, ts_end=ts_end)
+  if not url:
+    print(f"[AIS-POSITIONS] No URL constructed (mmsi={mmsi}, ts={ts_start}→{ts_end})")
+    return {"type": "__log_only", "tool": "get_ais_positions", "reason": "no_url"}
+
+  try:
+    resp = requests.get(url, timeout=60,auth=(ais_username,ais_password))
+    resp.raise_for_status()
+    data = resp.json()
+  except Exception as e:
+    print(f"[AIS-POSITIONS] Request failed: mmsi={mmsi} err={type(e).__name__}: {e}")
+    return {"type": "__log_only", "tool": "get_ais_positions", "reason": "request_failed"}
+
+  # try common shapes for positions
+  positions = []
+  if isinstance(data, dict):
+    for key in ("data", "positions", "track"):
+      v = data.get(key)
+      if isinstance(v, list):
+        positions = v
+        break
+
+  print(
+      "[AIS-POSITIONS] FULL DUMP",
+      f"mmsi={mmsi}",
+      f"ts={ts_start}→{ts_end}",
+      f"count={len(positions)}",
+      f"url={url}"
+  )
+  print(json.dumps(positions, indent=2))
+
+  # IMPORTANT: mark as log-only; your response assembler must ignore this
+  return {"type": "__log_only", "tool": "get_ais_positions", "count": n, "url": url}

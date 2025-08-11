@@ -34,7 +34,9 @@ def get_credentials_from_secrets_manager() -> dict:
     secret_data = json.loads(secret_string)
     return {
       "username": secret_data.get("username"),
-      "password": secret_data.get("password")
+      "password": secret_data.get("password"),
+      "ais_username": secret_data.get("ais_username"),
+      "ais_password": secret_data.get("ais_password")
     }
   except ClientError as e:
     logger.error(f"Error fetching secrets: {e}")

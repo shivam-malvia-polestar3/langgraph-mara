@@ -40,10 +40,16 @@ def run_graph(body: NLQuery):
   tool_results: List[dict] = []
   for m in new_messages:
     if isinstance(m, ToolMessage):
+      # ignore logging-only AIS positions
+      if getattr(m, "name", "") == "get_ais_positions":
+       continue
       try:
-        tool_results.append(json.loads(m.content))
+        payload = json.loads(m.content)
       except Exception:
-        pass
+        continue
+      if isinstance(payload, dict) and payload.get("type") == "__log_only":
+        continue
+      tool_results.append(payload)
 
   # Group by type and summarize
   grouped: Dict[str, List[dict]] = {}
