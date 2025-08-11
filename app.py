@@ -4,14 +4,14 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 
 from tools_common import utcnow_iso
-from graph_build import graph, planner, PLANNER_BASE_SYSTEM, summarize_per_tool
+from graph_multi import run_turn, summarize_per_tool
 from session_store import (
   SESSIONS, SESSION_CTX, SESSIONS_META,
   get_or_create_session, context_system_prompt,
   seed_defaults_from_query, update_ctx_from_tool_calls
 )
 
-app = FastAPI(title="Polestar LangGraph (Parallel tools + per-tool summaries + session memory + transcripts)")
+app = FastAPI(title="Polestar LangGraph (Multi-Agent Router + Specialists)")
 
 class NLQuery(BaseModel):
   query: str
@@ -23,67 +23,55 @@ def run_graph(body: NLQuery):
   session_id = get_or_create_session(body.session_id)
   correlation_id = body.correlation_id
 
-  # Seed context from NL
+  # Seed session context from natural language (IMO/MMSI/time range/top N/duration hints)
   seed_defaults_from_query(session_id, body.query)
 
-  # Build message list with tight planner rules
+  # Prepare current history
   history = SESSIONS[session_id][:]
-  base_system = SystemMessage(content=PLANNER_BASE_SYSTEM)
-  ctx_system = context_system_prompt(session_id)
 
-  msgs: List = []
-  msgs.append(base_system)
-  if ctx_system: msgs.append(ctx_system)
-  msgs.extend(history)
-  msgs.append(HumanMessage(body.query))
+  # Mark boundary to only collect *this* turn's outputs
+  before_len = len(history)
 
-  # Mark boundary to only collect this turn's outputs
-  before_len = len(msgs)
+  # Execute one routed turn
+  new_messages = run_turn(session_id, body.query, history)
 
-  # Invoke graph
-  final = graph.invoke({"messages": msgs})
-
-  # Extract *new* messages from this turn
-  new_msgs = final["messages"][before_len:] if len(final["messages"]) > before_len else final["messages"]
-
-  # Collect tool outputs (this turn only)
+  # Collect tool outputs for *this turn only*
   import json
   tool_results: List[dict] = []
-  for m in new_msgs:
+  for m in new_messages:
     if isinstance(m, ToolMessage):
       try:
         tool_results.append(json.loads(m.content))
       except Exception:
         pass
 
-  # Group by 'type'
+  # Group by type and summarize
   grouped: Dict[str, List[dict]] = {}
   for r in tool_results:
     typ = r.get("type", "unknown")
     grouped.setdefault(typ, []).append(r)
-
-  # Per-type summaries
   summaries = summarize_per_tool(grouped) if grouped else {}
 
-  # Final AI text from this turn
-  final_ai = next((m for m in reversed(new_msgs) if getattr(m, "type", "") == "ai"), None)
+  # Final AI text from this turn (if any)
+  final_ai = next((m for m in reversed(new_messages) if getattr(m, "type", "") == "ai"), None)
   final_text = getattr(final_ai, "content", "") if final_ai else ""
 
-  # Persist conversation
+  # Persist conversation (append user + new agent/tool messages)
   SESSIONS[session_id].append(HumanMessage(body.query))
-  for m in new_msgs:
+  for m in new_messages:
     if isinstance(m, (AIMessage, ToolMessage)):
       SESSIONS[session_id].append(m)
 
-  # Update metadata
+  # Metadata updates
   meta = SESSIONS_META.setdefault(session_id, {"created_at": utcnow_iso(), "last_activity_at": utcnow_iso(), "first_user_message": None})
   if meta.get("first_user_message") is None:
     meta["first_user_message"] = body.query
   meta["last_activity_at"] = utcnow_iso()
 
   # Update session defaults (IMO/MMSI/timestamps & last_vessels)
-  update_ctx_from_tool_calls(session_id, new_msgs)
+  update_ctx_from_tool_calls(session_id, new_messages)
 
+  # Return only this turn’s outputs
   return {
     "session_id": session_id,
     "correlation_id": correlation_id,
@@ -116,14 +104,16 @@ def summarize_session(session_id: str):
       lines.append(f"User: {c}")
   transcript = "\n".join(lines)
 
-  from graph_build import summarizer
-  sys = SystemMessage(content="Summarize the following conversation for a maritime analytics context, capturing intent, key tools/data retrieved, and outcomes.")
+  from langchain_openai import ChatOpenAI
+  from langchain_core.messages import SystemMessage, HumanMessage
+  summarizer = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+  sys = SystemMessage(content="Summarize the conversation for a maritime analytics context, capturing intent, tools/data retrieved, and outcomes.")
   msg = summarizer.invoke([sys, HumanMessage(content=transcript)])
   return {"session_id": session_id, "summary": getattr(msg, "content", "")}
 
 @app.get("/sessions/{session_id}/transcript")
 def get_transcript(session_id: str):
-  """Return the full conversation (user + assistant + tool markers) for UI rendering."""
+  """Return the full conversation for UI rendering."""
   history = SESSIONS.get(session_id, [])
   out = []
   for m in history:
@@ -151,7 +141,7 @@ def get_transcript(session_id: str):
 
 @app.get("/sessions")
 def list_sessions():
-  """List sessions with their first user message (for sidebar list like ChatGPT)."""
+  """List sessions with their first user message (for a sidebar like ChatGPT)."""
   items = []
   for sid, meta in SESSIONS_META.items():
     items.append({

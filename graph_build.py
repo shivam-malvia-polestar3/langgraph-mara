@@ -55,6 +55,9 @@ PLANNER_BASE_SYSTEM = (
   "   • If the user asks to 'search/find vessels', then (and only then) call get_vessel_data with explicit filters.\n"
   "6) Complete the plan first, then reply. Prefer issuing all needed tool calls in a single turn.\n"
   "7) If essential information is still missing after reading the context_system_prompt, respond with a clarifying question instead of calling any tools.\n"
+  "8) Complete the plan first, then reply. Prefer issuing all needed tool calls before answering.\n"
+  "9) After receiving tool results, ALWAYS produce a short, user-friendly final answer summarizing what you found. "
+  "If results are large, give the count and key highlights; do not just call tools and stop.\n"
 )
 
 def _run_tools_concurrently(tool_calls: List[dict]) -> List[ToolMessage]:
