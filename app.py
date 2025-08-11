@@ -10,7 +10,7 @@ from session_store import (
   get_or_create_session, context_system_prompt,
   seed_defaults_from_query, update_ctx_from_tool_calls
 )
-
+from graph_build import summarizer
 app = FastAPI(title="Polestar LangGraph (Multi-Agent Router + Specialists)")
 
 class NLQuery(BaseModel):
@@ -54,7 +54,8 @@ def run_graph(body: NLQuery):
 
   # Final AI text from this turn (if any)
   final_ai = next((m for m in reversed(new_messages) if getattr(m, "type", "") == "ai"), None)
-  final_text = getattr(final_ai, "content", "") if final_ai else ""
+  fallback_text = getattr(final_ai, "content", "") if final_ai else ""
+  final_text = make_compact_nl_final_text(summaries, fallback_text)
 
   # Persist conversation (append user + new agent/tool messages)
   SESSIONS[session_id].append(HumanMessage(body.query))
@@ -164,3 +165,22 @@ def reset_session(session_id: str):
 @app.get("/healthz")
 def healthz():
   return {"ok": True}
+
+
+def make_compact_nl_final_text(summaries: Dict[str, str], fallback_text: str) -> str:
+  """Return a tiny one-liner. If summaries exist, compress them; else use fallback_text."""
+  if not summaries:
+    return fallback_text or ""
+  # stitch summaries and compress with strict length guard
+  stitched = " | ".join(f"[{k}] {v}" for k, v in summaries.items())
+  sys = SystemMessage(content="Summarize in <= 20 words, neutral tone. No lists. No extra detail.")
+  msg = summarizer.invoke([sys, HumanMessage(content=stitched)])
+  tiny = getattr(msg, "content", "").strip()
+  if not tiny:
+    tiny = "Quick summary available. Further details are below."
+  else:
+    # ensure it’s small even if model drifts
+    if len(tiny) > 140:
+      tiny = tiny[:137] + "..."
+    tiny = f"Quick summary: {tiny} Further details are below."
+  return tiny

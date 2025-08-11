@@ -199,7 +199,7 @@ def normalize_spoofing_events(spoofing_data: dict) -> List[dict]:
   return out
 
 # ========= AIS positions link =========
-def construct_vessel_position_url(mmsi: Optional[str], ts_start: str, ts_end: str) -> Optional[str]:
+def fetch_ais_positions_data(mmsi: Optional[str], ts_start: str, ts_end: str) -> Optional[str]:
   if not mmsi:
     return None
   ts_start_dt = datetime.strptime(ts_start, ISO_FMT)

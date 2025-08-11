@@ -5,8 +5,7 @@ from tools_common import (
   APPLICATION_API_BASE, _normalize_ts, get_12_months_old_timestamp,
   get_current_timestamp, fetch_all_records,
   normalize_ais_gaps_response, normalize_sts_response,
-  normalize_zone_port_events, normalize_spoofing_events,
-  construct_vessel_position_url
+  normalize_zone_port_events, normalize_spoofing_events
 )
 
 def get_STS_min_duration_hours() -> int: return 6
@@ -30,8 +29,7 @@ def get_ais_gaps(imo: str,
   endpoint = f"{APPLICATION_API_BASE}/voyage-insights/v1/vessel-ais-reporting-gaps/{imo}"
   events, total, urls = fetch_all_records(endpoint, q)
   normalized = normalize_ais_gaps_response({"data": {"events": events}})
-  pos_url = construct_vessel_position_url(mmsi=mmsi, ts_start=ts_start, ts_end=ts_end)
-  return {"type": "a_g", "records": normalized, "total": total, "sources": urls, "pos_url": pos_url}
+  return {"type": "a_g", "records": normalized, "total": total, "sources": urls}
 
 @tool("get_sts_data", description="Retrieve normalized STS events for a vessel. Returns type='sts'.")
 def get_sts_data(imo: str,
@@ -52,8 +50,7 @@ def get_sts_data(imo: str,
   endpoint = f"{APPLICATION_API_BASE}/voyage-insights/v1/vessel-sts-pairings/{imo}"
   events, total, urls = fetch_all_records(endpoint, q)
   normalized = normalize_sts_response({"data": {"events": events}})
-  pos_url = construct_vessel_position_url(mmsi=mmsi, ts_start=ts_start, ts_end=ts_end)
-  return {"type": "sts", "records": normalized, "total": total, "sources": urls, "pos_url": pos_url}
+  return {"type": "sts", "records": normalized, "total": total, "sources": urls}
 
 @tool("get_zone_port_events", description="Retrieve normalized zone/port events. Returns type='z_p'.")
 def get_zone_port_events(imo: str,
@@ -70,8 +67,7 @@ def get_zone_port_events(imo: str,
   endpoint = f"{APPLICATION_API_BASE}/voyage-insights/v1/vessel-zone-and-port-events/{imo}"
   events, total, urls = fetch_all_records(endpoint, q)
   normalized = normalize_zone_port_events({"data": {"events": events}})
-  pos_url = construct_vessel_position_url(mmsi=mmsi, ts_start=ts_start, ts_end=ts_end)
-  return {"type": "z_p", "records": normalized, "total": total, "sources": urls, "pos_url": pos_url}
+  return {"type": "z_p", "records": normalized, "total": total, "sources": urls}
 
 @tool("get_positional_discrepancy", description="Retrieve positional discrepancy (spoofing) events. Returns type='p_d'.")
 def get_positional_discrepancy(imo: str,
@@ -97,5 +93,4 @@ def get_positional_discrepancy(imo: str,
   endpoint = f"{APPLICATION_API_BASE}/voyage-insights/v1/vessel-positional-discrepancy/{imo}"
   events, total, urls = fetch_all_records(endpoint, q)
   normalized = normalize_spoofing_events({"data": {"events": events}})
-  pos_url = construct_vessel_position_url(mmsi=mmsi, ts_start=ts_start, ts_end=ts_end)
-  return {"type": "p_d", "records": normalized, "total": total, "sources": urls, "pos_url": pos_url}
+  return {"type": "p_d", "records": normalized, "total": total, "sources": urls}
