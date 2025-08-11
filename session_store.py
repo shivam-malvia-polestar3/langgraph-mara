@@ -4,10 +4,9 @@ from langchain_core.messages import AnyMessage, SystemMessage, AIMessage, ToolMe
 
 from tools_common import utcnow_iso, _normalize_ts
 
-# ========= In-memory stores (swap for Redis/DB in prod) =========
-SESSIONS: Dict[str, List[AnyMessage]] = {}  # ordered history
-SESSION_CTX: Dict[str, Dict[str, Optional[str]]] = {}  # defaults + hints
-SESSIONS_META: Dict[str, Dict[str, Optional[str]]] = {}  # created_at, last_activity_at, first_user_message
+SESSIONS: Dict[str, List[AnyMessage]] = {}
+SESSION_CTX: Dict[str, Dict[str, Optional[str]]] = {}
+SESSIONS_META: Dict[str, Dict[str, Optional[str]]] = {}
 
 def get_or_create_session(session_id: str) -> str:
   SESSIONS.setdefault(session_id, [])
@@ -15,7 +14,6 @@ def get_or_create_session(session_id: str) -> str:
     "imo": None, "mmsi": None,
     "timestamp_start": None, "timestamp_end": None,
     "last_vessels": None, "selection_limit": None,
-    # NEW: lightweight user constraint hints the planner can use when mapping args
     "min_duration_hours_hint": None
   })
   SESSIONS_META.setdefault(session_id, {
@@ -32,6 +30,8 @@ def context_system_prompt(session_id: str) -> Optional[SystemMessage]:
     bits.append(f"default_time_window={ctx['timestamp_start']}→{ctx['timestamp_end']}")
   if ctx.get("last_vessels"):
     n = len(ctx["last_vessels"])
+    if n <= 15:
+      bits.append(f"last_vessels={','.join([str(x) for x in ctx['last_vessels']])}")
     bits.append(f"last_vessels_available={n}")
   if ctx.get("selection_limit"):
     bits.append(f"selection_limit={ctx['selection_limit']}")
@@ -46,7 +46,6 @@ def context_system_prompt(session_id: str) -> Optional[SystemMessage]:
   )
   return SystemMessage(content=txt)
 
-# ======== Lightweight NL seeding for IMO/MMSI/date ranges and selections/hints ========
 _MONTHS = {
   "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
   "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
@@ -66,26 +65,27 @@ def _try_make_date(month_name: str, year: str, role: str) -> Optional[str]:
     last = datetime(int(year), m+1, 1, tzinfo=timezone.utc) - timedelta(days=1)
   return last.strftime("%Y-%m-%d")
 
+# robust duration seeding: accepts >=, >, greater than/then, more than, over, longer than
+_DURATION_SEED = re.compile(
+    r'(?:duration|gap(?:\s*duration)?)\s*(?:>=|>|at\s*least|more\s+than|greater\s+(?:than|then)|over|longer\s+than)\s*(\d+)\s*(?:h|hr|hrs|hour|hours)\b',
+    re.IGNORECASE
+)
+
 def seed_defaults_from_query(session_id: str, query: str):
-  """Greedy parse of IMO/MMSI, Month-Year ranges, 'top N', and duration hints into session defaults."""
   ctx = SESSION_CTX.setdefault(session_id, {})
 
-  # IMO / MMSI
   m_imo = re.search(r'\bIMO\s*([0-9]{7})\b', query, re.IGNORECASE) or re.search(r'\bwith\s+imo\s+([0-9]{7})\b', query, re.IGNORECASE)
   if m_imo: ctx["imo"] = m_imo.group(1)
   m_mmsi = re.search(r'\bMMSI\s*([0-9]{9})\b', query, re.IGNORECASE)
   if m_mmsi: ctx["mmsi"] = m_mmsi.group(1)
 
-  # Top N selection
   m_top = re.search(r'\btop\s+(\d+)\b', query, re.IGNORECASE)
   if m_top: ctx["selection_limit"] = m_top.group(1)
 
-  # Duration greater than N hours (hint for gaps/spoofing/sts)
-  m_dur = re.search(r'(?:duration\s*(?:>|>=|greater\s+than)\s*)(\d+)\s*hour', query, re.IGNORECASE)
+  m_dur = _DURATION_SEED.search(query or "")
   if m_dur:
     ctx["min_duration_hours_hint"] = m_dur.group(1)
 
-  # Date range: "Jan 2025 to Mar 2025"
   m_range = re.search(r'\b([A-Za-z]+)\s+(\d{4})\s*(?:to|-|–|—)\s*([A-Za-z]+)\s+(\d{4})\b', query, re.IGNORECASE)
   if m_range:
     s_mon, s_year, e_mon, e_year = m_range.groups()
@@ -95,7 +95,6 @@ def seed_defaults_from_query(session_id: str, query: str):
     if e_raw: ctx["timestamp_end"]   = _normalize_ts(e_raw, "end")
     return
 
-  # Single month-year like "in March 2025"
   m_single = re.search(r'\b([A-Za-z]+)\s+(\d{4})\b', query, re.IGNORECASE)
   if m_single:
     mon, yr = m_single.groups()
@@ -106,9 +105,7 @@ def seed_defaults_from_query(session_id: str, query: str):
       ctx["timestamp_end"]   = _normalize_ts(e_raw, "end")
 
 def update_ctx_from_tool_calls(session_id: str, new_messages: List[AnyMessage]):
-  """After a run, capture last used args and vessel lists from tool outputs."""
   ctx = SESSION_CTX.setdefault(session_id, {})
-  # Tool call args from AI messages
   for m in new_messages:
     if isinstance(m, AIMessage):
       tcs = getattr(m, "tool_calls", None) or []
@@ -119,7 +116,6 @@ def update_ctx_from_tool_calls(session_id: str, new_messages: List[AnyMessage]):
         if args.get("timestamp_start"): ctx["timestamp_start"] = _normalize_ts(args["timestamp_start"], "start")
         if args.get("timestamp_end"):   ctx["timestamp_end"]   = _normalize_ts(args["timestamp_end"], "end")
         if args.get("min_duration_hours"): ctx["min_duration_hours_hint"] = str(args["min_duration_hours"])
-  # Capture vessel list from ToolMessage payload
   import json
   for m in new_messages:
     if isinstance(m, ToolMessage):
@@ -130,4 +126,10 @@ def update_ctx_from_tool_calls(session_id: str, new_messages: List[AnyMessage]):
       if isinstance(payload, dict) and payload.get("type") == "vessels":
         v = payload.get("imos") or []
         if v:
+          try:
+            lim = int(ctx.get("selection_limit") or 0)
+          except Exception:
+            lim = 0
+          if lim and lim > 0:
+            v = v[:lim]
           ctx["last_vessels"] = v

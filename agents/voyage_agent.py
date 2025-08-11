@@ -1,3 +1,5 @@
+# agents/voyage_agent.py
+
 from typing import List
 import json
 import re
@@ -20,7 +22,8 @@ from tools_voyage import get_ais_gaps, get_sts_data, get_zone_port_events, \
 VOYAGE_POLICY = (
   "You are the Voyage Insights specialist.\n"
   "Use session defaults (IMO/MMSI/time window, last_vessels) and hints (min_duration_hours, selection_limit).\n"
-  "Only call the tools explicitly requested (sts, gaps, positional_discrepancy, zone_port).\n"
+  "Only call the tools explicitly requested (sts, gaps, positional_discrepancy, zone_port). "
+  "If 'last_vessels=<list>' is present in context, iterate that exact list (respect selection_limit) and pass the IMO explicitly.\n"
   "Additionally, whenever you call ANY of those tools, also call get_ais_positions exactly once with the same MMSI and time window. "
   "The AIS positions output is logging-only; never include it in user-facing replies.\n"
   "If you lack IMO and last_vessels, DO NOT call any tools; ask a short clarifying question.\n"
@@ -41,17 +44,14 @@ MAX_FANOUT_DEFAULT = 10
 def _has_default_imo(ctx_text: str) -> bool:
   return "default_imo=" in (ctx_text or "")
 
-
 def _last_vessels_count(ctx_text: str) -> int:
   # context_system_prompt may include last_vessels_available=<n> if present
   m = re.search(r"last_vessels_available=(\d+)", ctx_text or "")
   return int(m.group(1)) if m else 0
 
-
 def _selection_limit(ctx_text: str) -> int:
   m = re.search(r"selection_limit=(\d+)", ctx_text or "")
   return int(m.group(1)) if m else 0
-
 
 class VoyageInsightsAgent:
   """
